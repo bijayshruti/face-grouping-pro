@@ -1,5 +1,4 @@
 import streamlit as st
-import face_recognition
 import os
 import tempfile
 import zipfile
@@ -12,8 +11,17 @@ import pandas as pd
 import plotly.graph_objects as go
 from pathlib import Path
 import time
-from multiprocessing import Pool, cpu_count
 import shutil
+import cv2
+
+# Try to import face_recognition, provide fallback if not available
+try:
+    import face_recognition
+    FACE_RECOGNITION_AVAILABLE = True
+except ImportError as e:
+    st.error(f"Face recognition library not available: {str(e)}")
+    st.info("Please make sure all dependencies are properly installed.")
+    FACE_RECOGNITION_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
@@ -51,6 +59,13 @@ st.markdown("""
         border-left: 5px solid #5cb85c;
         margin-bottom: 1rem;
     }
+    .warning-box {
+        background-color: #fcf8e3;
+        padding: 1rem;
+        border-radius: 5px;
+        border-left: 5px solid #f0ad4e;
+        margin-bottom: 1rem;
+    }
     .footer {
         text-align: center;
         padding: 1rem;
@@ -78,15 +93,31 @@ if 'grouped_faces' not in st.session_state:
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 
+# Check if face_recognition is available
+if not FACE_RECOGNITION_AVAILABLE:
+    st.markdown("""
+    <div class="warning-box">
+        <h4>⚠️ Face Recognition Library Not Available</h4>
+        <p>The face recognition library could not be loaded. This might be due to installation issues.</p>
+        <p>Please try one of these solutions:</p>
+        <ul>
+            <li>Wait a few minutes and refresh the page (dependencies might still be installing)</li>
+            <li>Check the app logs for more details</li>
+            <li>Contact the app administrator</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
 # ========== Helper Functions ==========
-@st.cache_data(show_spinner=False)
 def extract_face_descriptor(image_bytes, image_name):
     """Extract face encoding from image bytes"""
+    if not FACE_RECOGNITION_AVAILABLE:
+        return []
+    
     try:
         # Convert bytes to numpy array
         nparr = np.frombuffer(image_bytes, np.uint8)
-        from cv2 import imdecode
-        img = imdecode(nparr, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         # Convert BGR to RGB
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -102,6 +133,9 @@ def extract_face_descriptor(image_bytes, image_name):
 
 def group_similar_embeddings(descriptors, threshold=0.3):
     """Group similar face embeddings"""
+    if not descriptors:
+        return []
+    
     groups = []
     used = [False] * len(descriptors)
     
@@ -203,16 +237,19 @@ with col1:
 with col2:
     st.markdown("### ⚙️ Processing Settings")
     
-    threshold = st.slider(
-        "Similarity Threshold",
-        min_value=0.1,
-        max_value=0.8,
-        value=0.3,
-        step=0.05,
-        help="Lower values = stricter matching, Higher values = looser matching"
-    )
-    
-    use_multiprocessing = st.checkbox("Use multiprocessing (faster)", value=True)
+    if FACE_RECOGNITION_AVAILABLE:
+        threshold = st.slider(
+            "Similarity Threshold",
+            min_value=0.1,
+            max_value=0.8,
+            value=0.3,
+            step=0.05,
+            help="Lower values = stricter matching, Higher values = looser matching"
+        )
+        
+        use_multiprocessing = st.checkbox("Use multiprocessing (faster)", value=True)
+    else:
+        st.warning("Face recognition is currently unavailable. Please check the system status.")
     
     st.markdown("### 📊 Statistics")
     
@@ -239,6 +276,8 @@ with col2:
 if st.button("🚀 Start Processing", type="primary", use_container_width=True):
     if not uploaded_files:
         st.error("Please upload at least one image first!")
+    elif not FACE_RECOGNITION_AVAILABLE:
+        st.error("Face recognition is not available. Cannot process images.")
     else:
         # Progress bar
         progress_bar = st.progress(0)
@@ -270,7 +309,7 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
                 file.seek(0)
             
             if not all_descriptors:
-                st.error("No faces found in the uploaded images!")
+                st.warning("No faces found in the uploaded images!")
             else:
                 # Step 2: Group similar faces
                 status_text.text("🔄 Grouping similar faces...")
@@ -344,20 +383,3 @@ st.markdown("""
     <p>Designed by Bijay Paswan | v1.0 | Face Grouping Professional</p>
 </div>
 """, unsafe_allow_html=True)
-
-# Requirements for requirements.txt
-requirements = """
-streamlit
-face-recognition
-opencv-python-headless
-numpy
-openpyxl
-Pillow
-plotly
-pandas
-"""
-
-# Save requirements to a file when running locally
-if __name__ == '__main__':
-    with open('requirements.txt', 'w') as f:
-        f.write(requirements.strip())
