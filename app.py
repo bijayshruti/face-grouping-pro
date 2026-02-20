@@ -1,27 +1,16 @@
 import streamlit as st
-import os
-import tempfile
-import zipfile
-from PIL import Image
+import cv2
 import numpy as np
+import mediapipe as mp
+from sklearn.metrics.pairwise import cosine_similarity
+import tempfile
+from PIL import Image
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from io import BytesIO
-import pandas as pd
 import plotly.graph_objects as go
-from pathlib import Path
-import time
 import shutil
-import cv2
-
-# Try to import face_recognition, provide fallback if not available
-try:
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError as e:
-    st.error(f"Face recognition library not available: {str(e)}")
-    st.info("Please make sure all dependencies are properly installed.")
-    FACE_RECOGNITION_AVAILABLE = False
+import os
 
 # Page configuration
 st.set_page_config(
@@ -30,6 +19,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Initialize MediaPipe Face Detection and Face Mesh
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
 
 # Custom CSS
 st.markdown("""
@@ -59,13 +53,6 @@ st.markdown("""
         border-left: 5px solid #5cb85c;
         margin-bottom: 1rem;
     }
-    .warning-box {
-        background-color: #fcf8e3;
-        padding: 1rem;
-        border-radius: 5px;
-        border-left: 5px solid #f0ad4e;
-        margin-bottom: 1rem;
-    }
     .footer {
         text-align: center;
         padding: 1rem;
@@ -93,46 +80,46 @@ if 'grouped_faces' not in st.session_state:
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 
-# Check if face_recognition is available
-if not FACE_RECOGNITION_AVAILABLE:
-    st.markdown("""
-    <div class="warning-box">
-        <h4>⚠️ Face Recognition Library Not Available</h4>
-        <p>The face recognition library could not be loaded. This might be due to installation issues.</p>
-        <p>Please try one of these solutions:</p>
-        <ul>
-            <li>Wait a few minutes and refresh the page (dependencies might still be installing)</li>
-            <li>Check the app logs for more details</li>
-            <li>Contact the app administrator</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ========== Helper Functions ==========
-def extract_face_descriptor(image_bytes, image_name):
-    """Extract face encoding from image bytes"""
-    if not FACE_RECOGNITION_AVAILABLE:
-        return []
-    
+def extract_face_features(image_bytes, image_name):
+    """Extract face landmarks as features using MediaPipe"""
     try:
         # Convert bytes to numpy array
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Convert BGR to RGB
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Get face encodings
-        face_locations = face_recognition.face_locations(img_rgb)
-        encodings = face_recognition.face_encodings(img_rgb, face_locations)
-        
-        return [(encoding, image_name) for encoding in encodings]
+        # Detect faces
+        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+            results = face_detection.process(img_rgb)
+            
+            if not results.detections:
+                return []
+            
+            features = []
+            # For each detected face, extract features
+            with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=10, min_detection_confidence=0.5) as face_mesh:
+                mesh_results = face_mesh.process(img_rgb)
+                
+                if mesh_results.multi_face_landmarks:
+                    for face_landmarks in mesh_results.multi_face_landmarks:
+                        # Extract landmark coordinates as features
+                        landmark_array = []
+                        for landmark in face_landmarks.landmark:
+                            landmark_array.extend([landmark.x, landmark.y, landmark.z])
+                        
+                        # Convert to numpy array and normalize
+                        feature_vector = np.array(landmark_array)
+                        feature_vector = (feature_vector - np.mean(feature_vector)) / np.std(feature_vector)
+                        features.append((feature_vector, image_name))
+            
+            return features
+            
     except Exception as e:
         st.error(f"Error processing {image_name}: {str(e)}")
         return []
 
-def group_similar_embeddings(descriptors, threshold=0.3):
-    """Group similar face embeddings"""
+def group_similar_faces(descriptors, threshold=0.7):
+    """Group similar faces based on feature similarity"""
     if not descriptors:
         return []
     
@@ -144,14 +131,18 @@ def group_similar_embeddings(descriptors, threshold=0.3):
             continue
         group = [descriptors[i][1]]  # Store image name
         used[i] = True
+        
         for j in range(i + 1, len(descriptors)):
             if not used[j]:
-                dist = np.linalg.norm(descriptors[i][0] - descriptors[j][0])
-                if dist < threshold:
+                # Calculate cosine similarity
+                similarity = cosine_similarity([descriptors[i][0]], [descriptors[j][0]])[0][0]
+                if similarity > threshold:  # Higher similarity means more similar
                     group.append(descriptors[j][1])
                     used[j] = True
+        
         if len(group) > 1:  # Only groups with multiple faces
             groups.append(group)
+    
     return groups
 
 def create_excel_with_images(groups, image_data):
@@ -201,7 +192,7 @@ def create_excel_with_images(groups, image_data):
         # Cleanup temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ========== Main App Layout ==========
+# Main app layout
 col1, col2 = st.columns([1, 1])
 
 with col1:
@@ -223,7 +214,7 @@ with col1:
         # Display uploaded images in a grid
         st.markdown("### 👁️ Preview")
         cols = st.columns(4)
-        for idx, file in enumerate(uploaded_files[:8]):  # Show first 8 images
+        for idx, file in enumerate(uploaded_files[:8]):
             with cols[idx % 4]:
                 try:
                     image = Image.open(file)
@@ -237,19 +228,14 @@ with col1:
 with col2:
     st.markdown("### ⚙️ Processing Settings")
     
-    if FACE_RECOGNITION_AVAILABLE:
-        threshold = st.slider(
-            "Similarity Threshold",
-            min_value=0.1,
-            max_value=0.8,
-            value=0.3,
-            step=0.05,
-            help="Lower values = stricter matching, Higher values = looser matching"
-        )
-        
-        use_multiprocessing = st.checkbox("Use multiprocessing (faster)", value=True)
-    else:
-        st.warning("Face recognition is currently unavailable. Please check the system status.")
+    threshold = st.slider(
+        "Similarity Threshold",
+        min_value=0.5,
+        max_value=0.95,
+        value=0.75,
+        step=0.05,
+        help="Higher values = stricter matching, Lower values = looser matching"
+    )
     
     st.markdown("### 📊 Statistics")
     
@@ -276,19 +262,17 @@ with col2:
 if st.button("🚀 Start Processing", type="primary", use_container_width=True):
     if not uploaded_files:
         st.error("Please upload at least one image first!")
-    elif not FACE_RECOGNITION_AVAILABLE:
-        st.error("Face recognition is not available. Cannot process images.")
     else:
         # Progress bar
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         try:
-            # Step 1: Extract face encodings
-            status_text.text("📸 Extracting faces from images...")
+            # Step 1: Extract face features
+            status_text.text("📸 Detecting faces and extracting features...")
             progress_bar.progress(10)
             
-            all_descriptors = []
+            all_features = []
             image_data = {}
             
             for idx, file in enumerate(uploaded_files):
@@ -301,21 +285,21 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
                 file_bytes = file.read()
                 image_data[file.name] = file_bytes
                 
-                # Extract face descriptors
-                descriptors = extract_face_descriptor(file_bytes, file.name)
-                all_descriptors.extend(descriptors)
+                # Extract face features
+                features = extract_face_features(file_bytes, file.name)
+                all_features.extend(features)
                 
                 # Reset file pointer for future reads
                 file.seek(0)
             
-            if not all_descriptors:
+            if not all_features:
                 st.warning("No faces found in the uploaded images!")
             else:
                 # Step 2: Group similar faces
                 status_text.text("🔄 Grouping similar faces...")
                 progress_bar.progress(70)
                 
-                grouped_faces = group_similar_embeddings(all_descriptors, threshold)
+                grouped_faces = group_similar_faces(all_features, threshold)
                 
                 # Step 3: Create Excel file
                 status_text.text("📊 Creating Excel report...")
@@ -336,6 +320,7 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
                 <div class="success-box">
                     <h4>✅ Processing Complete!</h4>
                     <p>Found {len(grouped_faces)} groups of similar faces</p>
+                    <p>Total faces detected: {len(all_features)}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -360,21 +345,24 @@ if st.session_state.processed and st.session_state.grouped_faces:
     
     groups = st.session_state.grouped_faces
     
-    # Create tabs for each group
-    tabs = st.tabs([f"Group {i+1} ({len(group)} faces)" for i, group in enumerate(groups)])
-    
-    for idx, (tab, group) in enumerate(zip(tabs, groups)):
-        with tab:
-            cols = st.columns(3)
-            for img_idx, image_name in enumerate(group):
-                with cols[img_idx % 3]:
-                    # Find the image in uploaded files
-                    for file in uploaded_files:
-                        if file.name == image_name:
-                            image = Image.open(file)
-                            st.image(image, caption=image_name, use_column_width=True)
-                            file.seek(0)  # Reset file pointer
-                            break
+    if groups:
+        # Create tabs for each group
+        tabs = st.tabs([f"Group {i+1} ({len(group)} faces)" for i, group in enumerate(groups)])
+        
+        for idx, (tab, group) in enumerate(zip(tabs, groups)):
+            with tab:
+                cols = st.columns(3)
+                for img_idx, image_name in enumerate(group):
+                    with cols[img_idx % 3]:
+                        # Find the image in uploaded files
+                        for file in uploaded_files:
+                            if file.name == image_name:
+                                image = Image.open(file)
+                                st.image(image, caption=image_name, use_column_width=True)
+                                file.seek(0)
+                                break
+    else:
+        st.info("No face groups were found. Try adjusting the similarity threshold.")
 
 # Footer
 st.markdown("---")
