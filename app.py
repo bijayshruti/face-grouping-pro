@@ -1,8 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
-import mediapipe as mp
-from sklearn.metrics.pairwise import cosine_similarity
+from deepface import DeepFace
 import tempfile
 from PIL import Image
 from openpyxl import Workbook
@@ -11,6 +10,7 @@ from io import BytesIO
 import plotly.graph_objects as go
 import shutil
 import os
+import pandas as pd
 
 # Page configuration
 st.set_page_config(
@@ -19,11 +19,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Initialize MediaPipe Face Detection and Face Mesh
-mp_face_detection = mp.solutions.face_detection
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
 
 # Custom CSS
 st.markdown("""
@@ -80,46 +75,37 @@ if 'grouped_faces' not in st.session_state:
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 
-def extract_face_features(image_bytes, image_name):
-    """Extract face landmarks as features using MediaPipe"""
+def save_uploaded_file(uploaded_file):
+    """Save uploaded file to temporary location and return path"""
     try:
-        # Convert bytes to numpy array
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces
-        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-            results = face_detection.process(img_rgb)
-            
-            if not results.detections:
-                return []
-            
-            features = []
-            # For each detected face, extract features
-            with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=10, min_detection_confidence=0.5) as face_mesh:
-                mesh_results = face_mesh.process(img_rgb)
-                
-                if mesh_results.multi_face_landmarks:
-                    for face_landmarks in mesh_results.multi_face_landmarks:
-                        # Extract landmark coordinates as features
-                        landmark_array = []
-                        for landmark in face_landmarks.landmark:
-                            landmark_array.extend([landmark.x, landmark.y, landmark.z])
-                        
-                        # Convert to numpy array and normalize
-                        feature_vector = np.array(landmark_array)
-                        feature_vector = (feature_vector - np.mean(feature_vector)) / np.std(feature_vector)
-                        features.append((feature_vector, image_name))
-            
-            return features
-            
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            return tmp_file.name
     except Exception as e:
-        st.error(f"Error processing {image_name}: {str(e)}")
+        st.error(f"Error saving file: {str(e)}")
+        return None
+
+def extract_face_embedding(image_path, image_name):
+    """Extract face embedding using DeepFace"""
+    try:
+        # Use DeepFace to get face embeddings
+        embeddings = DeepFace.represent(
+            img_path=image_path,
+            model_name="Facenet",  # Lightweight and accurate
+            enforce_detection=False,
+            detector_backend='opencv'  # Use OpenCV for detection (lighter)
+        )
+        
+        if embeddings and len(embeddings) > 0:
+            # Return the embedding and image name
+            return [(np.array(embeddings[0]['embedding']), image_name)]
+        return []
+    except Exception as e:
+        st.warning(f"Could not process {image_name}: {str(e)}")
         return []
 
-def group_similar_faces(descriptors, threshold=0.7):
-    """Group similar faces based on feature similarity"""
+def group_similar_faces(descriptors, threshold=0.6):
+    """Group similar faces based on embedding similarity"""
     if not descriptors:
         return []
     
@@ -134,9 +120,10 @@ def group_similar_faces(descriptors, threshold=0.7):
         
         for j in range(i + 1, len(descriptors)):
             if not used[j]:
-                # Calculate cosine similarity
-                similarity = cosine_similarity([descriptors[i][0]], [descriptors[j][0]])[0][0]
-                if similarity > threshold:  # Higher similarity means more similar
+                # Calculate cosine distance
+                from scipy.spatial.distance import cosine
+                distance = cosine(descriptors[i][0], descriptors[j][0])
+                if distance < threshold:  # Lower distance means more similar
                     group.append(descriptors[j][1])
                     used[j] = True
         
@@ -145,7 +132,7 @@ def group_similar_faces(descriptors, threshold=0.7):
     
     return groups
 
-def create_excel_with_images(groups, image_data):
+def create_excel_with_images(groups, image_data, image_paths):
     """Create Excel file with grouped faces and embedded images"""
     wb = Workbook()
     ws = wb.active
@@ -162,24 +149,21 @@ def create_excel_with_images(groups, image_data):
     try:
         for group_num, group in enumerate(groups, start=1):
             for image_name in group:
-                # Save image temporarily
-                img_bytes = image_data[image_name]
-                temp_path = os.path.join(temp_dir, image_name)
-                with open(temp_path, 'wb') as f:
-                    f.write(img_bytes)
-                
-                # Add to Excel
-                try:
-                    img = ExcelImage(temp_path)
-                    img.width = 100
-                    img.height = 100
-                    ws.add_image(img, f'A{row_num}')
-                except:
-                    ws[f'A{row_num}'] = "[Image Error]"
-                
-                ws[f'B{row_num}'] = image_name
-                ws[f'C{row_num}'] = f"Group {group_num}"
-                row_num += 1
+                if image_name in image_paths:
+                    temp_path = image_paths[image_name]
+                    
+                    # Add to Excel
+                    try:
+                        img = ExcelImage(temp_path)
+                        img.width = 100
+                        img.height = 100
+                        ws.add_image(img, f'A{row_num}')
+                    except Exception as e:
+                        ws[f'A{row_num}'] = "[Image Error]"
+                    
+                    ws[f'B{row_num}'] = image_name
+                    ws[f'C{row_num}'] = f"Group {group_num}"
+                    row_num += 1
         
         # Save to BytesIO
         excel_bytes = BytesIO()
@@ -230,11 +214,11 @@ with col2:
     
     threshold = st.slider(
         "Similarity Threshold",
-        min_value=0.5,
-        max_value=0.95,
-        value=0.75,
+        min_value=0.3,
+        max_value=0.9,
+        value=0.6,
         step=0.05,
-        help="Higher values = stricter matching, Lower values = looser matching"
+        help="Lower values = stricter matching, Higher values = looser matching"
     )
     
     st.markdown("### 📊 Statistics")
@@ -268,44 +252,44 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
         status_text = st.empty()
         
         try:
-            # Step 1: Extract face features
-            status_text.text("📸 Detecting faces and extracting features...")
-            progress_bar.progress(10)
+            # Step 1: Save uploaded files temporarily
+            status_text.text("💾 Preparing images...")
+            progress_bar.progress(5)
             
-            all_features = []
-            image_data = {}
+            all_embeddings = []
+            image_paths = {}
+            temp_files = []
             
             for idx, file in enumerate(uploaded_files):
                 # Update progress
-                progress = 10 + int((idx / len(uploaded_files)) * 50)
+                progress = 5 + int((idx / len(uploaded_files)) * 45)
                 progress_bar.progress(progress)
                 status_text.text(f"Processing {file.name}...")
                 
-                # Read file bytes
-                file_bytes = file.read()
-                image_data[file.name] = file_bytes
-                
-                # Extract face features
-                features = extract_face_features(file_bytes, file.name)
-                all_features.extend(features)
-                
-                # Reset file pointer for future reads
-                file.seek(0)
+                # Save file temporarily
+                temp_path = save_uploaded_file(file)
+                if temp_path:
+                    temp_files.append(temp_path)
+                    image_paths[file.name] = temp_path
+                    
+                    # Extract face embedding
+                    embeddings = extract_face_embedding(temp_path, file.name)
+                    all_embeddings.extend(embeddings)
             
-            if not all_features:
+            if not all_embeddings:
                 st.warning("No faces found in the uploaded images!")
             else:
                 # Step 2: Group similar faces
                 status_text.text("🔄 Grouping similar faces...")
                 progress_bar.progress(70)
                 
-                grouped_faces = group_similar_faces(all_features, threshold)
+                grouped_faces = group_similar_faces(all_embeddings, threshold)
                 
                 # Step 3: Create Excel file
                 status_text.text("📊 Creating Excel report...")
                 progress_bar.progress(85)
                 
-                excel_file = create_excel_with_images(grouped_faces, image_data)
+                excel_file = create_excel_with_images(grouped_faces, image_paths, image_paths)
                 
                 # Step 4: Complete
                 progress_bar.progress(100)
@@ -320,7 +304,7 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
                 <div class="success-box">
                     <h4>✅ Processing Complete!</h4>
                     <p>Found {len(grouped_faces)} groups of similar faces</p>
-                    <p>Total faces detected: {len(all_features)}</p>
+                    <p>Total faces detected: {len(all_embeddings)}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -337,6 +321,13 @@ if st.button("🚀 Start Processing", type="primary", use_container_width=True):
             st.error(f"An error occurred: {str(e)}")
             progress_bar.empty()
             status_text.empty()
+        finally:
+            # Cleanup temp files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
 # Results display
 if st.session_state.processed and st.session_state.grouped_faces:
